@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { Session } from "@supabase/supabase-js";
 import { supabase, isConfigured } from "./supabase";
 import { fetchBundle, fetchProjects } from "./db";
-import type { ProjectBundle, ProjectRollup } from "./types";
+import type { ProjectBundle, ProjectRollup, Task } from "./types";
 
 /* ------------------------------------------------------------------- auth */
 
@@ -88,17 +88,78 @@ export function useProject(projectId: string | undefined) {
   const [bundle, setBundle] = useState<ProjectBundle | null>(null);
   const [error, setError] = useState<string | null>(null);
   const inFlight = useRef(false);
+  const queued = useRef(false);
 
+  /**
+   * Changes shown on screen before the server has confirmed them, by task.
+   *
+   * Each reload is numbered when it starts. A change is kept laid over the
+   * screen until a reload that STARTED after the change's write finished has
+   * landed. Dropping it the moment the write finished was not enough: a reload
+   * issued before the write could still land afterwards, carrying the old
+   * value, and put it back on screen for a second or two.
+   */
+  const pending = useRef<Map<string, { patch: Partial<Task>; settledGen: number | null }>>(new Map());
+  const gen = useRef(0);
+
+  const overlay = useCallback((b: ProjectBundle | null, landedGen: number): ProjectBundle | null => {
+    if (!b) return b;
+    for (const [id, entry] of pending.current) {
+      if (entry.settledGen !== null && landedGen > entry.settledGen) pending.current.delete(id);
+    }
+    if (pending.current.size === 0) return b;
+    return {
+      ...b,
+      tasks: b.tasks.map((t) => {
+        const p = pending.current.get(t.id);
+        return p ? { ...t, ...p.patch } : t;
+      }),
+    };
+  }, []);
+
+  /**
+   * Shows a task change at once, ahead of the server. Returns a function to
+   * call once the write has finished, succeeded or not.
+   */
+  const patchTask = useCallback(
+    (id: string, patch: Partial<Task>): (() => void) => {
+      const prev = pending.current.get(id);
+      pending.current.set(id, { patch: { ...(prev?.patch ?? {}), ...patch }, settledGen: null });
+      setBundle((b) => overlay(b, 0));
+      return () => {
+        const entry = pending.current.get(id);
+        if (entry) entry.settledGen = gen.current;
+      };
+    },
+    [overlay]
+  );
+
+  /**
+   * Refetches everything. A reload asked for while one is already running is
+   * not dropped but run once more afterwards, so the screen always ends up
+   * showing the last write. Dropping it was why a change made during a
+   * refresh never appeared until the panel was reopened.
+   */
   const reload = useCallback(async () => {
-    if (!projectId || inFlight.current) return;
+    if (!projectId) return;
+    if (inFlight.current) {
+      queued.current = true;
+      return;
+    }
     inFlight.current = true;
     try {
-      setError(null);
-      setBundle(await fetchBundle(projectId));
+      do {
+        queued.current = false;
+        setError(null);
+        const myGen = ++gen.current;
+        const fresh = await fetchBundle(projectId);
+        setBundle(overlay(fresh, myGen));
+      } while (queued.current);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
       inFlight.current = false;
+      queued.current = false;
     }
   }, [projectId]);
 
@@ -107,36 +168,7 @@ export function useProject(projectId: string | undefined) {
     void reload();
   }, [reload]);
 
-  useEffect(() => {
-    if (!projectId || !isConfigured) return;
-
-    // Several rows often change at once, for instance when a task is marked
-    // done and its progress note is written. Coalesce them into one refetch.
-    let timer: ReturnType<typeof setTimeout> | null = null;
-    const nudge = () => {
-      if (timer) clearTimeout(timer);
-      timer = setTimeout(() => void reload(), 350);
-    };
-
-    const channel = supabase.channel(`project:${projectId}`);
-    for (const table of ["tasks", "milestones", "risks", "updates", "links", "project_members"]) {
-      channel.on(
-        "postgres_changes",
-        { event: "*", schema: "public", table, filter: `project_id=eq.${projectId}` },
-        nudge
-      );
-    }
-    // RACI rows carry no project_id, so they cannot be filtered server side.
-    channel.on("postgres_changes", { event: "*", schema: "public", table: "raci_assignments" }, nudge);
-    channel.subscribe();
-
-    return () => {
-      if (timer) clearTimeout(timer);
-      void supabase.removeChannel(channel);
-    };
-  }, [projectId, reload]);
-
-  return { bundle, error, reload, loading: bundle === null && error === null };
+  return { bundle, error, reload, patchTask, loading: bundle === null && error === null };
 }
 
 /* ------------------------------------------------------------------ misc */

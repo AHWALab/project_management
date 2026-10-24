@@ -23,7 +23,7 @@ import {
   StagePill,
   Toast,
 } from "../components/bits";
-import { addTask, deleteTask, setTaskDone, updateTask } from "../lib/db";
+import { addTask, changeTask, deleteTask, reconcileTask } from "../lib/db";
 import { useAction, usePrefersReducedMotion } from "../lib/hooks";
 import {
   fmtDate,
@@ -50,13 +50,20 @@ interface Node {
   stage: Stage;
 }
 
-export default function Timeline({ bundle, reload, me }: TabProps) {
+export default function Timeline({ bundle, reload, patchTask, me }: TabProps) {
   const { project, tasks, members } = bundle;
   const { run, error } = useAction();
   const [toast, setToast] = useState<string | null>(null);
   const [zoom, setZoom] = useState<Zoom>("week");
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
-  const [openTask, setOpenTask] = useState<Task | null>(null);
+  // Only the id is stored. The task itself is looked up from the live bundle
+  // on every render, so a save that refreshes the bundle refreshes the panel.
+  // Storing the object froze the panel at whatever it showed when opened.
+  const [openTaskId, setOpenTaskId] = useState<string | null>(null);
+  const openTask = useMemo(
+    () => (openTaskId ? tasks.find((t) => t.id === openTaskId) ?? null : null),
+    [tasks, openTaskId]
+  );
   const [adding, setAdding] = useState<{ parent: Task | null } | null>(null);
 
   const memberById = useMemo(() => new Map(members.map((m) => [m.id, m])), [members]);
@@ -321,7 +328,7 @@ export default function Timeline({ bundle, reload, me }: TabProps) {
                         depth > 0 && <CornerDownRight size={11} className="shrink-0 text-ink-3 opacity-50" />
                       )}
                       <button
-                        onClick={() => setOpenTask(task)}
+                        onClick={() => setOpenTaskId(task.id)}
                         className={`truncate text-left text-[13.5px] hover:underline ${isGroup ? "font-bold" : ""} ${task.status === "done" ? "text-ink-3 line-through decoration-1" : ""}`}
                         title={task.title}
                       >
@@ -355,13 +362,20 @@ export default function Timeline({ bundle, reload, me }: TabProps) {
                       <span className="mono text-[11.5px] text-ink-3 text-right">{node.pct}%</span>
                     ) : (
                       <button
-                        onClick={() =>
+                        onClick={() => {
+                          const patch = { status: task.status === "done" ? "in_progress" : "done" } as const;
+                          const settle = patchTask(task.id, reconcileTask(task, patch));
                           act(
-                            () =>
-                              setTaskDone(task, task.status !== "done", { id: me.id, name: me.name }),
+                            async () => {
+                              try {
+                                await changeTask(task, patch, { id: me.id, name: me.name });
+                              } finally {
+                                settle();
+                              }
+                            },
                             task.status === "done" ? "Task reopened" : "Task marked done"
-                          )
-                        }
+                          );
+                        }}
                         aria-label={task.status === "done" ? `Reopen ${task.title}` : `Mark ${task.title} done`}
                         aria-pressed={task.status === "done"}
                         className="justify-self-end grid place-items-center rounded transition"
@@ -418,7 +432,7 @@ export default function Timeline({ bundle, reload, me }: TabProps) {
                     <div key={task.id} className="relative border-b border-line" style={{ height: ROW_H }}>
                       <button
                         data-bar
-                        onClick={() => setOpenTask(task)}
+                        onClick={() => setOpenTaskId(task.id)}
                         title={`${task.title}\n${fmtDate(isoDay(s))} to ${fmtDate(isoDay(e))}\n${pct}% complete`}
                         className="absolute top-1/2 -translate-y-1/2 text-left"
                         style={{
@@ -487,13 +501,14 @@ export default function Timeline({ bundle, reload, me }: TabProps) {
         task={openTask}
         members={members}
         me={me}
-        onClose={() => setOpenTask(null)}
+        onPatch={patchTask}
+        onClose={() => setOpenTaskId(null)}
         onChanged={async (msg) => {
           await reload();
           if (msg) setToast(msg);
         }}
         onDeleted={async () => {
-          setOpenTask(null);
+          setOpenTaskId(null);
           await reload();
           setToast("Task deleted");
         }}
@@ -705,6 +720,7 @@ function TaskPanel({
   task,
   members,
   me,
+  onPatch,
   onClose,
   onChanged,
   onDeleted,
@@ -712,25 +728,62 @@ function TaskPanel({
   task: Task | null;
   members: Member[];
   me: { id: string; name: string };
+  onPatch: (id: string, patch: Partial<Task>) => () => void;
   onClose: () => void;
   onChanged: (msg?: string) => Promise<void>;
   onDeleted: () => Promise<void>;
 }) {
   const { run, error } = useAction();
   const [confirming, setConfirming] = useState(false);
+  /** Slider position while a drag is in progress; null when idle. */
+  const [dragPct, setDragPct] = useState<number | null>(null);
+  const commitRef = useRef<() => void>(() => {});
 
   useEffect(() => {
     setConfirming(false);
+    setDragPct(null);
   }, [task?.id]);
+
+  // Safety net: if the slider has been left on a value for a while with no
+  // release event arriving, save it anyway. Normal drags save on release.
+  useEffect(() => {
+    if (dragPct === null) return;
+    const t = setTimeout(() => commitRef.current(), 1500);
+    return () => clearTimeout(t);
+  }, [dragPct]);
 
   if (!task) return null;
   const stage = taskStage(task);
 
-  const save = (patch: Partial<Task>, msg?: string) =>
+  /**
+   * Every edit in this panel goes through here. The change shows on screen at
+   * once, then is written, then the fresh row replaces the optimistic copy.
+   * Status and percentage are reconciled so they cannot contradict each other.
+   */
+  const save = (patch: Partial<Task>) => {
+    const fields = reconcileTask(task, patch);
+    if (Object.keys(fields).length === 0) return;
+    const settle = onPatch(task.id, fields);
+    const wasDone = task.status === "done";
+    const isDone = (fields.status ?? task.status) === "done";
+    const msg = isDone && !wasDone ? "Task marked done" : !isDone && wasDone ? "Task reopened" : undefined;
     void run(async () => {
-      await updateTask(task.id, patch);
+      try {
+        await changeTask(task, patch, me);
+      } finally {
+        settle();
+      }
       await onChanged(msg);
     });
+  };
+
+  const commitDrag = () => {
+    if (dragPct === null) return;
+    const v = dragPct;
+    setDragPct(null);
+    if (v !== task.pct_complete) save({ pct_complete: v });
+  };
+  commitRef.current = commitDrag;
 
   return (
     <Dialog open onClose={onClose} title={task.is_summary ? "Group" : "Task"} width={560}>
@@ -791,21 +844,7 @@ function TaskPanel({
                 <select
                   aria-label="Status"
                   value={task.status}
-                  onChange={(e) => {
-                    const next = e.target.value as Task["status"];
-                    if (next === "done") {
-                      void run(async () => {
-                        await setTaskDone(task, true, me);
-                        await onChanged("Task marked done");
-                      });
-                    } else {
-                      save({
-                        status: next,
-                        completed_at: null,
-                        pct_complete: task.status === "done" ? 90 : task.pct_complete,
-                      });
-                    }
-                  }}
+                  onChange={(e) => save({ status: e.target.value as Task["status"] })}
                   className="qf"
                 >
                   {(Object.keys(taskStatusLabel) as Task["status"][]).map((s) => (
@@ -825,16 +864,22 @@ function TaskPanel({
                 <label htmlFor="pct" className="text-[13px] font-semibold">
                   Progress
                 </label>
-                <span className="mono text-[15px] font-bold">{task.pct_complete}%</span>
+                <span className="mono text-[15px] font-bold">{dragPct ?? task.pct_complete}%</span>
               </div>
+              {/* The slider follows your hand locally and saves once on release.
+                  Saving on every pixel sent dozens of writes per drag, and the
+                  last one to land was not always the last one you made. */}
               <input
                 id="pct"
                 type="range"
                 min={0}
                 max={100}
                 step={5}
-                value={task.pct_complete}
-                onChange={(e) => save({ pct_complete: Number(e.target.value) })}
+                value={dragPct ?? task.pct_complete}
+                onChange={(e) => setDragPct(Number(e.target.value))}
+                onPointerUp={commitDrag}
+                onKeyUp={commitDrag}
+                onBlur={commitDrag}
                 className="w-full"
                 style={{ accentColor: "var(--c-reach)", height: 22 }}
               />
@@ -842,23 +887,7 @@ function TaskPanel({
                 {[0, 25, 50, 75, 100].map((v) => (
                   <button
                     key={v}
-                    onClick={() => {
-                      // 100 percent and "done" should not be able to disagree.
-                      if (v === 100 && task.status !== "done") {
-                        void run(async () => {
-                          await setTaskDone(task, true, me);
-                          await onChanged("Task marked done");
-                        });
-                      } else if (v < 100 && task.status === "done") {
-                        void run(async () => {
-                          await setTaskDone(task, false, me);
-                          await updateTask(task.id, { pct_complete: v });
-                          await onChanged("Task reopened");
-                        });
-                      } else {
-                        save({ pct_complete: v });
-                      }
-                    }}
+                    onClick={() => v !== task.pct_complete && save({ pct_complete: v })}
                     aria-pressed={task.pct_complete === v}
                     className="mono flex-1 rounded py-1 text-[12px] font-semibold transition"
                     style={{

@@ -6,7 +6,7 @@ import { ErrorNote, Spinner, StagePill } from "../components/bits";
 import { useProject, type Me } from "../lib/hooks";
 import { countProblems } from "../lib/raci";
 import { riskScore, taskStage, milestoneStage } from "../lib/status";
-import type { ProjectBundle } from "../lib/types";
+import type { ProjectBundle, Task } from "../lib/types";
 
 import Overview from "../tabs/Overview";
 import Timeline from "../tabs/Timeline";
@@ -19,6 +19,8 @@ import Team from "../tabs/Team";
 export interface TabProps {
   bundle: ProjectBundle;
   reload: () => Promise<void>;
+  /** Show a task change on screen immediately, ahead of the server. */
+  patchTask: (id: string, patch: Partial<Task>) => () => void;
   me: Me;
 }
 
@@ -36,7 +38,7 @@ type TabId = (typeof TABS)[number]["id"];
 
 export default function ProjectPage({ me }: { me: Me }) {
   const { id } = useParams<{ id: string }>();
-  const { bundle, error, reload, loading } = useProject(id);
+  const { bundle, error, reload, patchTask, loading } = useProject(id);
   const [params, setParams] = useSearchParams();
 
   const current = (params.get("tab") as TabId | null) ?? "overview";
@@ -154,13 +156,13 @@ export default function ProjectPage({ me }: { me: Me }) {
             })}
           </nav>
 
-          {active === "overview" && <Overview bundle={bundle} reload={reload} me={me} />}
-          {active === "timeline" && <Timeline bundle={bundle} reload={reload} me={me} />}
-          {active === "raci" && <RaciTab bundle={bundle} reload={reload} me={me} />}
-          {active === "milestones" && <Milestones bundle={bundle} reload={reload} me={me} />}
-          {active === "risks" && <Risks bundle={bundle} reload={reload} me={me} />}
-          {active === "activity" && <Activity bundle={bundle} reload={reload} me={me} />}
-          {active === "team" && <Team bundle={bundle} reload={reload} me={me} />}
+          {active === "overview" && <Overview bundle={bundle} reload={reload} patchTask={patchTask} me={me} />}
+          {active === "timeline" && <Timeline bundle={bundle} reload={reload} patchTask={patchTask} me={me} />}
+          {active === "raci" && <RaciTab bundle={bundle} reload={reload} patchTask={patchTask} me={me} />}
+          {active === "milestones" && <Milestones bundle={bundle} reload={reload} patchTask={patchTask} me={me} />}
+          {active === "risks" && <Risks bundle={bundle} reload={reload} patchTask={patchTask} me={me} />}
+          {active === "activity" && <Activity bundle={bundle} reload={reload} patchTask={patchTask} me={me} />}
+          {active === "team" && <Team bundle={bundle} reload={reload} patchTask={patchTask} me={me} />}
         </>
       )}
     </Shell>

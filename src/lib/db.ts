@@ -194,6 +194,71 @@ export async function deleteTask(id: string): Promise<void> {
 }
 
 /**
+ * Keeps a task's status and its percentage from contradicting each other.
+ * Given what the person changed, returns the full set of fields to write.
+ *
+ *   status -> not started    percentage becomes 0
+ *   status -> done           percentage becomes 100
+ *   status -> anything else  a task that was done drops back to 90
+ *   percentage -> 100        status becomes done
+ *   percentage -> 0          an in progress task becomes not started
+ *   percentage -> 1 to 99    a not started or done task becomes in progress
+ *
+ * Blocked is left alone by percentage changes, because being stuck at 40 is a
+ * real state and the person who set it should be the one to clear it.
+ */
+export function reconcileTask(task: Task, patch: Partial<Task>): Partial<Task> {
+  const next: Partial<Task> = { ...patch };
+  const wasDone = task.status === "done";
+
+  if (next.status !== undefined) {
+    if (next.status === "not_started") next.pct_complete = 0;
+    else if (next.status === "done") next.pct_complete = 100;
+    else if (wasDone) next.pct_complete = Math.min(task.pct_complete, 90);
+  } else if (next.pct_complete !== undefined) {
+    const pct = next.pct_complete;
+    if (pct >= 100 && !wasDone) next.status = "done";
+    else if (pct === 0 && task.status === "in_progress") next.status = "not_started";
+    else if (pct > 0 && pct < 100 && (task.status === "not_started" || wasDone)) {
+      next.status = "in_progress";
+    }
+  }
+
+  const willBeDone = (next.status ?? task.status) === "done";
+  if (willBeDone && !wasDone) next.completed_at = new Date().toISOString();
+  if (!willBeDone && wasDone) next.completed_at = null;
+
+  return next;
+}
+
+/**
+ * Writes a reconciled change and, when the task crosses into or out of done,
+ * the activity line that explains it.
+ */
+export async function changeTask(
+  task: Task,
+  patch: Partial<Task>,
+  author: { id: string; name: string }
+): Promise<Partial<Task>> {
+  const fields = reconcileTask(task, patch);
+  await updateTask(task.id, fields);
+
+  const wasDone = task.status === "done";
+  const isDone = (fields.status ?? task.status) === "done";
+  if (isDone !== wasDone) {
+    await addUpdate({
+      project_id: task.project_id,
+      task_id: task.id,
+      author_id: author.id,
+      author_name: author.name,
+      body: null,
+      kind: isDone ? "completed" : "reopened",
+    });
+  }
+  return fields;
+}
+
+/**
  * Marking a task done is the single most common action in the app, so it also
  * writes the progress note that explains itself in the activity feed.
  */
