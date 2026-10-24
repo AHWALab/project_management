@@ -322,7 +322,6 @@ function NewProject({
         summary: summary.trim() || null,
         start_date: start || null,
         end_date: end || null,
-        ownerUserId: me.id,
         ownerName: me.name,
       });
       newId = p.id;

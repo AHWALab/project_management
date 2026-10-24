@@ -254,24 +254,6 @@ as $$
   );
 $$;
 
--- Needed only to break a chicken and egg problem. Right after a project is
--- inserted its creator is not yet a member, so no policy would let them add
--- the first seat. This runs as definer because reading projects from inside a
--- policy would itself be filtered by the projects policy.
-create or replace function is_project_creator(p uuid)
-returns boolean
-language sql
-security definer
-stable
-set search_path = public
-as $$
-  select exists (
-    select 1 from projects pr
-     where pr.id = p
-       and pr.created_by = auth.uid()
-  );
-$$;
-
 alter table profiles         enable row level security;
 alter table projects         enable row level security;
 alter table project_members  enable row level security;
@@ -318,11 +300,12 @@ create policy members_read on project_members
   using (user_id = auth.uid() or is_project_member(project_id));
 
 -- Deliberately NOT "user_id = auth.uid()". That would let any signed in person
--- add themselves to any project and read it.
+-- add themselves to any project and read it. The very first seat, the
+-- creator's own, is written by create_project below rather than from here.
 drop policy if exists members_insert on project_members;
 create policy members_insert on project_members
   for insert to authenticated
-  with check (is_project_admin(project_id) or is_project_creator(project_id));
+  with check (is_project_admin(project_id));
 
 -- Admins manage the roster. Anyone may correct their own name and role.
 drop policy if exists members_update on project_members;
@@ -378,6 +361,74 @@ create policy reminder_log_none on reminder_log
   for select to authenticated using (false);
 
 -- ============================================================================
+-- Creating a project.
+--
+-- Two rows have to appear together: the project, and the creator's own
+-- membership. Written from a browser as two requests, the creator is briefly
+-- not a member of their own project, and projects_read then refuses to return
+-- the row that was just inserted. One definer function avoids that gap.
+-- ============================================================================
+
+create or replace function create_project(
+  p_name       text,
+  p_code       text default null,
+  p_summary    text default null,
+  p_start      date default null,
+  p_end        date default null,
+  p_owner_name text default null
+)
+returns projects
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  uid  uuid := auth.uid();
+  proj projects;
+begin
+  if uid is null then
+    raise exception 'You are not signed in' using errcode = '42501';
+  end if;
+
+  if coalesce(btrim(p_name), '') = '' then
+    raise exception 'A project needs a name' using errcode = '22023';
+  end if;
+
+  insert into projects (name, code, summary, start_date, end_date, created_by)
+  values (
+    btrim(p_name),
+    nullif(btrim(coalesce(p_code, '')), ''),
+    nullif(btrim(coalesce(p_summary, '')), ''),
+    p_start,
+    p_end,
+    uid
+  )
+  returning * into proj;
+
+  -- The creator is the first member and an admin. Without this row the row
+  -- level security rules would hide the project from its own author.
+  insert into project_members (project_id, user_id, display_name, role, is_admin)
+  values (
+    proj.id,
+    uid,
+    coalesce(
+      nullif(btrim(coalesce(p_owner_name, '')), ''),
+      (select nullif(btrim(coalesce(full_name, '')), '') from profiles where id = uid),
+      (select email from profiles where id = uid),
+      'Me'
+    ),
+    'Project lead',
+    true
+  );
+
+  return proj;
+end;
+$$;
+
+revoke all     on function create_project(text, text, text, date, date, text) from public;
+grant  execute on function create_project(text, text, text, date, date, text) to authenticated;
+
+-- ============================================================================
 -- Helper used by the landing page: every row a signed in person is allowed to
 -- see, already joined, so the client makes one request instead of six.
 -- ============================================================================
@@ -405,3 +456,5 @@ select
 from projects p;
 
 grant select on my_projects to authenticated;
+
+drop function if exists is_project_creator(uuid);

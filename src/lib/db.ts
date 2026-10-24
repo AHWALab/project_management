@@ -106,46 +106,31 @@ export async function fetchBundle(projectId: string): Promise<ProjectBundle> {
 
 /* --------------------------------------------------------------- projects */
 
+/**
+ * Creating a project writes two rows: the project, and the creator's own
+ * membership. Done from here as two requests, the creator is briefly not a
+ * member of their own project, and the rule that lets members read a project
+ * then refuses to return the row that was just written. So both rows are
+ * written by one database function instead, in a single transaction.
+ */
 export async function createProject(input: {
   name: string;
   code?: string | null;
   summary?: string | null;
   start_date?: string | null;
   end_date?: string | null;
-  ownerUserId: string;
   ownerName: string;
 }): Promise<Project> {
-  const project = check<Project>(
-    await supabase
-      .from("projects")
-      .insert({
-        name: input.name,
-        code: input.code || null,
-        summary: input.summary || null,
-        start_date: input.start_date || null,
-        end_date: input.end_date || null,
-        created_by: input.ownerUserId,
-      })
-      .select()
-      .single()
+  return check<Project>(
+    await supabase.rpc("create_project", {
+      p_name: input.name,
+      p_code: input.code ?? null,
+      p_summary: input.summary ?? null,
+      p_start: input.start_date || null,
+      p_end: input.end_date || null,
+      p_owner_name: input.ownerName,
+    })
   );
-
-  // The creator becomes the first member and an admin. Without this row the
-  // row level security policies would hide the project from its own author.
-  const seat = await supabase.from("project_members").insert({
-    project_id: project.id,
-    user_id: input.ownerUserId,
-    display_name: input.ownerName,
-    role: "Project lead",
-    is_admin: true,
-  });
-  if (seat.error) {
-    // Leaving a project nobody can see would be worse than failing loudly.
-    await supabase.from("projects").delete().eq("id", project.id);
-    throw new Error(`Could not add you to the new project: ${seat.error.message}`);
-  }
-
-  return project;
 }
 
 export async function updateProject(id: string, patch: Partial<Project>): Promise<void> {
