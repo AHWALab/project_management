@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { supabase, redirectUrl } from "../lib/supabase";
 import { ErrorNote } from "../components/bits";
 
@@ -23,13 +23,36 @@ function Trace() {
   );
 }
 
+type Mode = "link" | "password";
+const MODE_KEY = "ahwa.signin.mode";
+
+function readMode(): Mode {
+  try {
+    return localStorage.getItem(MODE_KEY) === "password" ? "password" : "link";
+  } catch {
+    // Private windows and blocked site data both land here.
+    return "link";
+  }
+}
+
 export default function SignIn() {
+  // Whichever way you got in last time is the way offered first next time.
+  const [mode, setMode] = useState<Mode>(readMode);
   const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
   const [sent, setSent] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  async function send(e: React.FormEvent) {
+  useEffect(() => {
+    try {
+      localStorage.setItem(MODE_KEY, mode);
+    } catch {
+      /* Not remembering the choice is not worth interrupting anyone. */
+    }
+  }, [mode]);
+
+  async function sendLink(e: React.FormEvent) {
     e.preventDefault();
     const address = email.trim().toLowerCase();
     if (!address) return;
@@ -40,8 +63,40 @@ export default function SignIn() {
       options: { emailRedirectTo: redirectUrl() },
     });
     setBusy(false);
-    if (err) setError(err.message);
-    else setSent(true);
+    if (!err) {
+      setSent(true);
+      return;
+    }
+    // The built in sender is throttled, and the raw message does not say what
+    // to do about it.
+    if (/rate limit/i.test(err.message)) {
+      setError(
+        "Too many sign in emails in the last hour. Use a password below, or try again later."
+      );
+      return;
+    }
+    setError(err.message);
+  }
+
+  async function signInWithPassword(e: React.FormEvent) {
+    e.preventDefault();
+    const address = email.trim().toLowerCase();
+    if (!address || !password) return;
+    setBusy(true);
+    setError(null);
+    const { error: err } = await supabase.auth.signInWithPassword({
+      email: address,
+      password,
+    });
+    setBusy(false);
+    if (!err) return; // The session arrives and the app re-renders itself.
+    if (/invalid login credentials/i.test(err.message)) {
+      setError(
+        "That email and password do not match an account. If you have never set a password, sign in with an emailed link instead."
+      );
+      return;
+    }
+    setError(err.message);
   }
 
   return (
@@ -62,7 +117,7 @@ export default function SignIn() {
             <p className="text-sm text-ink-2">
               A sign in link is on its way to{" "}
               <span className="mono text-ink font-medium">{email.trim().toLowerCase()}</span>. Open it
-              on this device. The link works once and expires in an hour.
+              in this browser. The link works once and expires in an hour.
             </p>
             <button
               className="btn mt-4"
@@ -71,37 +126,105 @@ export default function SignIn() {
                 setError(null);
               }}
             >
-              Use a different address
+              Back
             </button>
           </div>
         ) : (
-          <form onSubmit={send} className="border border-line rounded-lg bg-surface p-5">
-            <label htmlFor="email" className="block text-sm font-semibold mb-1.5">
-              Your email
-            </label>
-            <input
-              id="email"
-              type="email"
-              required
-              autoFocus
-              autoComplete="email"
-              placeholder="you@uiowa.edu"
-              value={email}
-              onChange={(e) => setEmail(e.target.value)}
-              className="field mono"
-            />
-            <p className="text-[13px] text-ink-3 mt-2">
-              No password. We email you a link that signs you in.
-            </p>
-            {error && (
-              <div className="mt-3">
-                <ErrorNote message={error} />
-              </div>
-            )}
-            <button type="submit" className="btn btn-primary w-full justify-center mt-4" disabled={busy}>
-              {busy ? "Sending" : "Email me a sign in link"}
-            </button>
-          </form>
+          <div className="border border-line rounded-lg bg-surface p-5">
+            <div
+              className="flex gap-0.5 p-0.5 rounded-md mb-4"
+              style={{ background: "var(--c-raised)", border: "1px solid var(--c-line)" }}
+              role="tablist"
+              aria-label="How to sign in"
+            >
+              {(
+                [
+                  ["link", "Emailed link"],
+                  ["password", "Password"],
+                ] as [Mode, string][]
+              ).map(([m, labelText]) => (
+                <button
+                  key={m}
+                  role="tab"
+                  aria-selected={mode === m}
+                  onClick={() => {
+                    setMode(m);
+                    setError(null);
+                  }}
+                  className="flex-1 rounded py-1.5 text-[13.5px] font-semibold transition"
+                  style={{
+                    background: mode === m ? "var(--c-surface)" : "transparent",
+                    color: mode === m ? "var(--c-ink)" : "var(--c-ink-3)",
+                    boxShadow: mode === m ? "0 1px 2px rgb(0 0 0 / 0.08)" : undefined,
+                  }}
+                >
+                  {labelText}
+                </button>
+              ))}
+            </div>
+
+            <form onSubmit={mode === "link" ? sendLink : signInWithPassword}>
+              <label htmlFor="email" className="block text-sm font-semibold mb-1.5">
+                Your email
+              </label>
+              <input
+                id="email"
+                type="email"
+                required
+                autoFocus
+                autoComplete="email"
+                placeholder="you@uiowa.edu"
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                className="field mono"
+              />
+
+              {mode === "password" ? (
+                <>
+                  <label htmlFor="password" className="block text-sm font-semibold mb-1.5 mt-3.5">
+                    Password
+                  </label>
+                  <input
+                    id="password"
+                    type="password"
+                    required
+                    autoComplete="current-password"
+                    value={password}
+                    onChange={(e) => setPassword(e.target.value)}
+                    className="field"
+                  />
+                  <p className="text-[13px] text-ink-3 mt-2">
+                    Only works if a password has been set for your account. You can set one from the
+                    account menu once you are signed in.
+                  </p>
+                </>
+              ) : (
+                <p className="text-[13px] text-ink-3 mt-2">
+                  No password. We email you a link that signs you in.
+                </p>
+              )}
+
+              {error && (
+                <div className="mt-3">
+                  <ErrorNote message={error} />
+                </div>
+              )}
+
+              <button
+                type="submit"
+                className="btn btn-primary w-full justify-center mt-4"
+                disabled={busy || !email.trim() || (mode === "password" && !password)}
+              >
+                {busy
+                  ? mode === "link"
+                    ? "Sending"
+                    : "Signing in"
+                  : mode === "link"
+                    ? "Email me a sign in link"
+                    : "Sign in"}
+              </button>
+            </form>
+          </div>
         )}
 
         <p className="text-[13px] text-ink-3 mt-5">
