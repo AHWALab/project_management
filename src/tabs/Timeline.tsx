@@ -20,7 +20,6 @@ import {
   EditableText,
   EmptyState,
   ErrorNote,
-  MiniBar,
   StagePill,
   Toast,
 } from "../components/bits";
@@ -737,11 +736,14 @@ function TaskPanel({
     <Dialog open onClose={onClose} title={task.is_summary ? "Group" : "Task"} width={560}>
       <div className="space-y-4">
         <div>
+          {/* Multiline so a long task name wraps instead of scrolling out of
+              sight, but newlines are collapsed because a title is one line. */}
           <EditableText
             value={task.title}
             ariaLabel="Task title"
-            onSave={(v) => v && save({ title: v })}
-            className="!text-[17px] font-semibold"
+            multiline
+            onSave={(v) => v && save({ title: v.replace(/\s+/g, " ").trim() })}
+            className="!text-[17px] font-semibold !leading-snug"
           />
           <div className="flex items-center gap-2 mt-1.5">
             <span className="mono text-[12px] text-ink-3">{task.wbs}</span>
@@ -815,12 +817,15 @@ function TaskPanel({
               </Labeled>
             </div>
 
+            {/* One bar only. An identical looking read only bar used to sit
+                underneath this slider, which made it unclear which of the two
+                you were meant to drag. */}
             <div>
               <div className="flex items-center justify-between mb-1.5">
                 <label htmlFor="pct" className="text-[13px] font-semibold">
                   Progress
                 </label>
-                <span className="mono text-[13px] font-semibold">{task.pct_complete}%</span>
+                <span className="mono text-[15px] font-bold">{task.pct_complete}%</span>
               </div>
               <input
                 id="pct"
@@ -831,11 +836,44 @@ function TaskPanel({
                 value={task.pct_complete}
                 onChange={(e) => save({ pct_complete: Number(e.target.value) })}
                 className="w-full"
-                style={{ accentColor: "var(--c-reach)" }}
+                style={{ accentColor: "var(--c-reach)", height: 22 }}
               />
-              <div className="mt-1.5">
-                <MiniBar value={task.pct_complete} stage={stage.stage} />
+              <div className="flex gap-1.5 mt-1" role="group" aria-label="Set progress">
+                {[0, 25, 50, 75, 100].map((v) => (
+                  <button
+                    key={v}
+                    onClick={() => {
+                      // 100 percent and "done" should not be able to disagree.
+                      if (v === 100 && task.status !== "done") {
+                        void run(async () => {
+                          await setTaskDone(task, true, me);
+                          await onChanged("Task marked done");
+                        });
+                      } else if (v < 100 && task.status === "done") {
+                        void run(async () => {
+                          await setTaskDone(task, false, me);
+                          await updateTask(task.id, { pct_complete: v });
+                          await onChanged("Task reopened");
+                        });
+                      } else {
+                        save({ pct_complete: v });
+                      }
+                    }}
+                    aria-pressed={task.pct_complete === v}
+                    className="mono flex-1 rounded py-1 text-[12px] font-semibold transition"
+                    style={{
+                      border: `1px solid ${task.pct_complete === v ? "var(--c-reach)" : "var(--c-line)"}`,
+                      background: task.pct_complete === v ? "var(--c-reach)" : "transparent",
+                      color: task.pct_complete === v ? "#fff" : "var(--c-ink-2)",
+                    }}
+                  >
+                    {v}
+                  </button>
+                ))}
               </div>
+              <p className="text-[12px] text-ink-3 mt-1.5">
+                Drag the slider or pick a value. Setting it to 100 marks the task done.
+              </p>
             </div>
           </>
         )}
